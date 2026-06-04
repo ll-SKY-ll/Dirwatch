@@ -1,0 +1,19 @@
+# Watches are configured per-room via `!dirwatch server …` commands.
+# This file holds command access control.
+
+# Users allowed to run normal commands. Supports exact MXIDs and fnmatch
+# globs. Empty list means anyone in a room with the bot may use them.
+allowed_users: []
+# Example:
+# allowed_users:
+#   - "@admin:example.com"
+#   - "@*:example.com"
+
+# Users allowed to run admin commands (`!dirwatch admin …`), which include
+# the cross-room overview. Same MXID/glob syntax. Empty list means the admin
+# commands are disabled for everyone until you populate this. Admins also
+# implicitly pass the `allowed_users` gate above.
+admin_users: []
+# Example:
+# admin_users:
+#   - "@you:example.com"

@@ -1,0 +1,11 @@
+id: net.codestorm.dirwatcher
+version: 1.4.0
+license: MIT
+modules:
+  - dirwatcher
+main_class: DirWatcherBot
+database: true
+database_type: asyncpg
+config: true
+extra_files:
+  - base-config.yaml
