@@ -1,7 +1,16 @@
 """Verifies config cleanup when the bot leaves/is removed from a room."""
 import asyncio, sys, types, os
 def _mk(n):
-    m = types.ModuleType(n); sys.modules[n] = m; return m
+    class _Auto:
+        def __init__(self, *a, **k): pass
+        def __call__(self, *a, **k):
+            return a[0] if (len(a) == 1 and callable(a[0]) and not k) else self
+        def __getattr__(self, _n): return _Auto()
+    class _StubMod(__import__("types").ModuleType):
+        def __getattr__(self, name):
+            v = _Auto(); object.__setattr__(self, name, v); return v
+    import sys as _ss
+    m = _StubMod(n); _ss.modules[n] = m; return m
 maubot = _mk("maubot")
 maubot.MessageEvent = type("MessageEvent", (), {})
 maubot.Plugin = type("Plugin", (), {})
@@ -26,7 +35,12 @@ cm = _mk("mautrix.util.config")
 cm.BaseProxyConfig = type("BaseProxyConfig", (), {})
 cm.ConfigUpdateHelper = type("ConfigUpdateHelper", (), {})
 _mk("mautrix"); _mk("mautrix.util")
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+import os
+_here = os.path.dirname(os.path.abspath(__file__))
+for _cand in (_here, os.path.dirname(_here)):
+    if os.path.isdir(os.path.join(_cand, "dirwatcher")):
+        sys.path.insert(0, _cand)
+        break
 import dirwatcher as dw
 
 class FakeDB:

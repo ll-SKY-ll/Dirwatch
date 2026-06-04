@@ -6,9 +6,16 @@ import types
 
 # ── stub out maubot/mautrix so we can import the plugin module ──
 def _mk(name):
-    m = types.ModuleType(name)
-    sys.modules[name] = m
-    return m
+    class _Auto:
+        def __init__(self, *a, **k): pass
+        def __call__(self, *a, **k):
+            return a[0] if (len(a) == 1 and callable(a[0]) and not k) else self
+        def __getattr__(self, _n): return _Auto()
+    class _StubMod(__import__("types").ModuleType):
+        def __getattr__(self, nm):
+            v = _Auto(); object.__setattr__(self, nm, v); return v
+    import sys as _ss
+    m = _StubMod(name); _ss.modules[name] = m; return m
 
 maubot = _mk("maubot")
 class MessageEvent: ...
@@ -47,8 +54,19 @@ _mk("mautrix")
 _mk("mautrix.util")
 
 import os
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import importlib
+import sys as _s
+_s.modules["maubot.handlers"].event = type("E", (), {"on": staticmethod(lambda *a, **k: (lambda fn: fn))})()
+_mt = _s.modules["mautrix.types"]
+_mt.Membership = type("M", (), {"LEAVE":"leave","BAN":"ban","JOIN":"join","INVITE":"invite"})
+_mt.StateEvent = object
+_mt.EventType.ROOM_MEMBER = "m.room.member"
+import os
+_here = os.path.dirname(os.path.abspath(__file__))
+for _cand in (_here, os.path.dirname(_here)):
+    if os.path.isdir(os.path.join(_cand, "dirwatcher")):
+        sys.path.insert(0, _cand)
+        break
 import dirwatcher as dw
 
 
