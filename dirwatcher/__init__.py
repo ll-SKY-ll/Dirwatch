@@ -14,11 +14,19 @@ from mautrix.util.config import BaseProxyConfig, ConfigUpdateHelper
 
 from .db import upgrade_table
 
+
+def _chunked(seq: list, size: int):
+    """Yield successive `size`-length chunks of `seq`."""
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
+
+
 DEFAULT_INTERVAL_MINUTES = 60
 DEFAULT_FETCH_LIMIT = 500
 DEFAULT_MAX_PER_MESSAGE = 50
 DEFAULT_INCLUDE_TOPIC = True
 DEFAULT_INCLUDE_MEMBERS = True
+DEFAULT_NOTIFY_REMOVALS = True
 # topic_collapse_length (per-(room, server) integer option):
 #   > 0  collapse topics longer than N chars behind an expandable <details>
 #   0    never collapse; show topics inline, in full
@@ -48,6 +56,7 @@ SETTABLE_KEYS: dict[str, type] = {
     "fetch_limit": int,
     "include_topic": bool,
     "include_members": bool,
+    "notify_removals": bool,
     "max_per_message": int,
     "topic_collapse_length": int,
 }
@@ -206,7 +215,7 @@ class DirWatcherBot(Plugin):
     async def _get_room_servers(self, matrix_room_id: str) -> list[dict[str, Any]]:
         rows = await self.database.fetch(
             "SELECT server, interval_minutes, fetch_limit, "
-            "include_topic, include_members, max_per_message, topic_collapse_length "
+            "include_topic, include_members, notify_removals, max_per_message, topic_collapse_length "
             "FROM room_watched_servers WHERE matrix_room_id=$1",
             matrix_room_id,
         )
@@ -272,7 +281,7 @@ class DirWatcherBot(Plugin):
     async def _get_all_room_configs(self) -> dict[str, list[dict[str, Any]]]:
         rows = await self.database.fetch(
             "SELECT matrix_room_id, server, interval_minutes, fetch_limit, "
-            "include_topic, include_members, max_per_message, topic_collapse_length "
+            "include_topic, include_members, notify_removals, max_per_message, topic_collapse_length "
             "FROM room_watched_servers"
         )
         result: dict[str, list[dict[str, Any]]] = {}
@@ -290,13 +299,17 @@ class DirWatcherBot(Plugin):
 
     # ── pending notification helpers ───────────────────────────
 
-    async def _get_rooms_watching_server(self, server: str) -> list[str]:
-        """Return matrix room IDs that watch `server`."""
+    async def _get_rooms_watching_server(
+        self, server: str
+    ) -> list[tuple[str, bool]]:
+        """Return (matrix_room_id, notify_removals) for rooms watching
+        `server`."""
         rows = await self.database.fetch(
-            "SELECT matrix_room_id FROM room_watched_servers WHERE server=$1",
+            "SELECT matrix_room_id, notify_removals "
+            "FROM room_watched_servers WHERE server=$1",
             server,
         )
-        return [r["matrix_room_id"] for r in rows]
+        return [(r["matrix_room_id"], bool(r["notify_removals"])) for r in rows]
 
     async def _enqueue_notifications(
         self,
@@ -314,7 +327,7 @@ class DirWatcherBot(Plugin):
         now = int(time.time())
         records: list[tuple] = []
 
-        for room_id in target_rooms:
+        for room_id, notify_removals in target_rooms:
             for rid in added_ids:
                 room = current_map.get(rid, {})
                 records.append((
@@ -325,6 +338,11 @@ class DirWatcherBot(Plugin):
                     room.get("num_joined_members", 0),
                     now,
                 ))
+            # Removal tracking is server-global (snapshot/stats already
+            # reflect it); here we just skip enqueuing the per-room
+            # "removed" notifications when this room opted out.
+            if not notify_removals:
+                continue
             for rid in removed_ids:
                 prev = prev_map.get(rid, {})
                 records.append((
@@ -436,10 +454,18 @@ class DirWatcherBot(Plugin):
                     )
 
             if ids_to_delete:
-                await self.database.execute(
-                    "DELETE FROM pending_notifications WHERE id = ANY($1::bigint[])",
-                    ids_to_delete,
-                )
+                # Portable IN (...) list in place of `= ANY($1::bigint[])`,
+                # which SQLite can't parse. Chunk to stay under SQLite's
+                # conservative 999-bound-variable limit on older builds.
+                for chunk in _chunked(ids_to_delete, 900):
+                    placeholders = ", ".join(
+                        f"${i}" for i in range(1, 1 + len(chunk))
+                    )
+                    await self.database.execute(
+                        f"DELETE FROM pending_notifications "
+                        f"WHERE id IN ({placeholders})",
+                        *chunk,
+                    )
 
     # ── polling loop ───────────────────────────────────────────
 
@@ -592,11 +618,19 @@ class DirWatcherBot(Plugin):
             removed_ids = prev_ids - current_ids
 
             if removed_ids:
-                await self.database.execute(
-                    "UPDATE directory_snapshot SET removed=TRUE, last_seen=$1 "
-                    "WHERE server=$2 AND room_id = ANY($3::text[])",
-                    now, server, list(removed_ids),
-                )
+                # SQLite has no array type, so `= ANY($n::text[])` isn't
+                # portable. Build IN (...) lists with positional params after
+                # the fixed now/server params, chunked to stay under SQLite's
+                # conservative 999-bound-variable limit on older builds.
+                for chunk in _chunked(list(removed_ids), 900):
+                    placeholders = ", ".join(
+                        f"${i}" for i in range(3, 3 + len(chunk))
+                    )
+                    await self.database.execute(
+                        "UPDATE directory_snapshot SET removed=TRUE, last_seen=$1 "
+                        f"WHERE server=$2 AND room_id IN ({placeholders})",
+                        now, server, *chunk,
+                    )
 
             if current_ids:
                 upsert_rows = [
@@ -858,6 +892,7 @@ class DirWatcherBot(Plugin):
         `server list` and `overview`."""
         topic_icon = "✓" if srv["include_topic"] else "✗"
         members_icon = "✓" if srv["include_members"] else "✗"
+        removals_icon = "✓" if srv.get("notify_removals", True) else "✗"
         tcl = srv["topic_collapse_length"]
         if tcl == 0:
             collapse_desc = "off"
@@ -869,6 +904,7 @@ class DirWatcherBot(Plugin):
             f"**{srv['server']}** — every {srv['interval_minutes']}m, "
             f"limit {srv['fetch_limit']}, "
             f"topic: {topic_icon}, members: {members_icon}, "
+            f"removals: {removals_icon}, "
             f"collapse: {collapse_desc}, max/msg: {srv['max_per_message']}"
         )
 

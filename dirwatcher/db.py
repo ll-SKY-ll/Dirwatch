@@ -1,6 +1,25 @@
-from mautrix.util.async_db import Connection, UpgradeTable
+from mautrix.util.async_db import Connection, Scheme, UpgradeTable
 
 upgrade_table = UpgradeTable()
+
+
+async def _column_exists(
+    conn: Connection, scheme: Scheme, table: str, column: str
+) -> bool:
+    """Scheme-agnostic check for whether `table.column` exists. Used in place
+    of Postgres-only `ADD/DROP COLUMN IF [NOT] EXISTS`, which SQLite rejects."""
+    if scheme == Scheme.POSTGRES:
+        return bool(
+            await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+                "WHERE table_name=$1 AND column_name=$2)",
+                table,
+                column,
+            )
+        )
+    rows = await conn.fetch(f"PRAGMA table_info({table})")
+    # PRAGMA rows expose the column name under key "name" (index 1).
+    return any((r["name"] if "name" in r.keys() else r[1]) == column for r in rows)
 
 
 @upgrade_table.register(description="Initial schema")
@@ -65,10 +84,19 @@ async def upgrade_v2(conn: Connection) -> None:
 @upgrade_table.register(
     description="Add pending_notifications table for multi-room delivery"
 )
-async def upgrade_v3(conn: Connection) -> None:
+async def upgrade_v3(conn: Connection, scheme: Scheme) -> None:
+    # Autoincrementing surrogate key. Postgres uses BIGSERIAL; SQLite uses a
+    # plain INTEGER PRIMARY KEY, which aliases the implicit rowid and
+    # autoincrements. Both yield monotonically increasing integer ids, which
+    # is all the delivery/cleanup code relies on.
+    id_column = (
+        "id BIGSERIAL PRIMARY KEY"
+        if scheme == Scheme.POSTGRES
+        else "id INTEGER PRIMARY KEY"
+    )
     await conn.execute(
-        """CREATE TABLE IF NOT EXISTS pending_notifications (
-            id              BIGSERIAL PRIMARY KEY,
+        f"""CREATE TABLE IF NOT EXISTS pending_notifications (
+            {id_column},
             server          TEXT NOT NULL,
             matrix_room_id  TEXT NOT NULL,
             change_type     TEXT NOT NULL,
@@ -89,16 +117,35 @@ async def upgrade_v3(conn: Connection) -> None:
 @upgrade_table.register(
     description="Add topic_collapse_length option to room_watched_servers"
 )
-async def upgrade_v4(conn: Connection) -> None:
+async def upgrade_v4(conn: Connection, scheme: Scheme) -> None:
     # Collapse threshold in characters:
     #   > 0  collapse topics longer than N chars behind a <details> disclosure
     #   0    never collapse (show topics inline, in full)
     #  -1    always collapse, regardless of length
-    await conn.execute(
-        "ALTER TABLE room_watched_servers "
-        "DROP COLUMN IF EXISTS collapse_topics"
-    )
-    await conn.execute(
-        "ALTER TABLE room_watched_servers "
-        "ADD COLUMN IF NOT EXISTS topic_collapse_length INTEGER NOT NULL DEFAULT 120"
-    )
+    if await _column_exists(conn, scheme, "room_watched_servers", "collapse_topics"):
+        await conn.execute(
+            "ALTER TABLE room_watched_servers DROP COLUMN collapse_topics"
+        )
+    if not await _column_exists(
+        conn, scheme, "room_watched_servers", "topic_collapse_length"
+    ):
+        await conn.execute(
+            "ALTER TABLE room_watched_servers "
+            "ADD COLUMN topic_collapse_length INTEGER NOT NULL DEFAULT 120"
+        )
+
+
+@upgrade_table.register(
+    description="Add notify_removals option to room_watched_servers"
+)
+async def upgrade_v5(conn: Connection, scheme: Scheme) -> None:
+    # When FALSE, the bot still tracks directory removals (snapshot/stats are
+    # server-global and unaffected) but skips enqueuing "removed" notifications
+    # for this (room, server). "added" notifications are unaffected.
+    if not await _column_exists(
+        conn, scheme, "room_watched_servers", "notify_removals"
+    ):
+        await conn.execute(
+            "ALTER TABLE room_watched_servers "
+            "ADD COLUMN notify_removals BOOLEAN NOT NULL DEFAULT TRUE"
+        )
