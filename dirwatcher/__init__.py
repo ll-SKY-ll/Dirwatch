@@ -61,6 +61,19 @@ SETTABLE_KEYS: dict[str, type] = {
     "topic_collapse_length": int,
 }
 
+# Single source of truth for per-server columns in room_watched_servers.
+# Add a new column here and every read path picks it up automatically.
+WATCHED_SERVER_COLUMNS: tuple[str, ...] = (
+    "server",
+    "interval_minutes",
+    "fetch_limit",
+    "include_topic",
+    "include_members",
+    "notify_removals",
+    "max_per_message",
+    "topic_collapse_length",
+)
+
 
 class Config(BaseProxyConfig):
     def do_update(self, helper: ConfigUpdateHelper) -> None:
@@ -213,13 +226,12 @@ class DirWatcherBot(Plugin):
     # ── per-room DB helpers ────────────────────────────────────
 
     async def _get_room_servers(self, matrix_room_id: str) -> list[dict[str, Any]]:
+        cols = ", ".join(WATCHED_SERVER_COLUMNS)
         rows = await self.database.fetch(
-            "SELECT server, interval_minutes, fetch_limit, "
-            "include_topic, include_members, notify_removals, max_per_message, topic_collapse_length "
-            "FROM room_watched_servers WHERE matrix_room_id=$1",
+            f"SELECT {cols} FROM room_watched_servers WHERE matrix_room_id=$1",
             matrix_room_id,
         )
-        return [dict(r) for r in rows]
+        return [self._row_to_server_dict(r) for r in rows]
 
     async def _add_room_server(
         self,
@@ -279,22 +291,15 @@ class DirWatcherBot(Plugin):
         return updated is not None
 
     async def _get_all_room_configs(self) -> dict[str, list[dict[str, Any]]]:
+        cols = ", ".join(WATCHED_SERVER_COLUMNS)
         rows = await self.database.fetch(
-            "SELECT matrix_room_id, server, interval_minutes, fetch_limit, "
-            "include_topic, include_members, notify_removals, max_per_message, topic_collapse_length "
-            "FROM room_watched_servers"
+            f"SELECT matrix_room_id, {cols} FROM room_watched_servers"
         )
         result: dict[str, list[dict[str, Any]]] = {}
         for r in rows:
-            result.setdefault(r["matrix_room_id"], []).append({
-                "server": r["server"],
-                "interval_minutes": r["interval_minutes"],
-                "fetch_limit": r["fetch_limit"],
-                "include_topic": r["include_topic"],
-                "include_members": r["include_members"],
-                "max_per_message": r["max_per_message"],
-                "topic_collapse_length": r["topic_collapse_length"],
-            })
+            result.setdefault(r["matrix_room_id"], []).append(
+                self._row_to_server_dict(r)
+            )
         return result
 
     # ── pending notification helpers ───────────────────────────
@@ -885,6 +890,13 @@ class DirWatcherBot(Plugin):
             await evt.reply(f"✅ Stopped watching **{server}** in this room.")
         else:
             await evt.reply(f"⚠️ **{server}** was not being watched in this room.")
+
+    @staticmethod
+    def _row_to_server_dict(row: Any) -> dict[str, Any]:
+        """Map a `room_watched_servers` row to the per-server dict shape used
+        by formatters and config readers. Pairs with WATCHED_SERVER_COLUMNS
+        so all read paths share one schema."""
+        return {col: row[col] for col in WATCHED_SERVER_COLUMNS}
 
     @staticmethod
     def _server_line(srv: dict) -> str:
